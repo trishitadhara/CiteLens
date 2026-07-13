@@ -1,0 +1,9 @@
+artifact_location: /Users/trishita/Downloads/citelens 2/data/mlruns/694271806055189813
+creation_time: 1783610547195
+effective_trace_archival_retention: null
+experiment_id: '694271806055189813'
+last_update_time: 1783610547195
+lifecycle_stage: active
+name: citelens
+trace_location: null
+workspace: default

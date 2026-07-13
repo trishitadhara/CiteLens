@@ -1,0 +1,14 @@
+artifact_uri: /Users/trishita/Downloads/citelens 2/data/mlruns/694271806055189813/63e8b12e4c34484a8976d01f6eabd887/artifacts
+end_time: 1783624483554
+entry_point_name: ''
+experiment_id: '694271806055189813'
+lifecycle_stage: active
+run_id: 63e8b12e4c34484a8976d01f6eabd887
+run_name: citefind_1783624483
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783624483533
+status: 3
+tags: []
+user_id: trishita
