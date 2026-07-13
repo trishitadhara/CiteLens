@@ -306,6 +306,20 @@ def _existence_check(citations: list[dict], progress_bar=None) -> list[dict]:
                 "matched_authors": paper.get("authors", []),
                 "doi": paper.get("doi") or cit.get("doi", ""),
             })
+        # Log to MLflow
+    try:
+        from eval.mlflow_logger import log_citecheck_run
+        import time
+        verdicts = [r["verdict"] for r in results]
+        log_citecheck_run(
+            n_citations=len(results),
+            verdicts=verdicts,
+            latency=0,
+        )
+    except Exception as e:
+        print(f"[MLflow] logging failed: {e}")
+
+    return results
 
     return results
 
