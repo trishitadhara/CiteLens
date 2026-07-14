@@ -97,7 +97,6 @@ def _parse_reference_list(text: str) -> list[dict]:
 
 
 def _extract_from_pdf(pdf_bytes: bytes) -> list[dict]:
-    """Extract reference list from PDF and return as citations."""
     try:
         import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -178,23 +177,63 @@ def _extract_doi(ref: str) -> str:
     return m.group().rstrip(".,)") if m else ""
 
 
-def _title_similar(a: str, b: str) -> bool:
-    if not a or not b:
-        return False
+def _title_overlap(a: str, b: str) -> float:
+    """Word overlap ratio between two titles ignoring stop words."""
     stops = {"a", "an", "the", "of", "in", "on", "for", "and", "or", "to", "with", "from"}
     a_words = set(re.sub(r"[^\w\s]", "", a.lower()).split()) - stops
     b_words = set(re.sub(r"[^\w\s]", "", b.lower()).split()) - stops
     if not a_words:
+        return 0.0
+    return len(a_words & b_words) / len(a_words)
+
+
+def _title_similar(a: str, b: str, threshold: float = 0.5) -> bool:
+    if not a or not b:
         return False
-    return len(a_words & b_words) / len(a_words) >= 0.5
+    a_words = set(re.sub(r"[^\w\s]", "", a.lower()).split())
+    b_words = set(re.sub(r"[^\w\s]", "", b.lower()).split())
+    # Require at least 2 matching words to avoid single-word false positives
+    if len(a_words & b_words) < 2:
+        return False
+    return _title_overlap(a, b) >= threshold
+
+
+def _any_author_match(found_authors: list[str], cit_authors: list[str]) -> bool:
+    """
+    Check if at least one last name from the citation matches a found author.
+    Returns True if either list is empty (can't verify, so don't reject).
+    """
+    if not cit_authors or not found_authors:
+        return True
+
+    # Extract last names from citation authors
+    cit_lastnames = set()
+    for a in cit_authors:
+        parts = re.split(r"[,\s]+", a.strip())
+        if parts:
+            cit_lastnames.add(parts[0].lower())  # "Last, First" format
+
+    # Extract last names from found authors
+    found_lastnames = set()
+    for a in found_authors:
+        parts = re.split(r"[,\s]+", a.strip())
+        if parts:
+            found_lastnames.add(parts[-1].lower())  # "First Last" format
+            found_lastnames.add(parts[0].lower())   # also check first word
+
+    return bool(cit_lastnames & found_lastnames)
 
 
 # ── CrossRef fallback ─────────────────────────────────────────────────────────
 
-def _crossref_lookup(title: str, year: str = "") -> dict | None:
+def _crossref_lookup(title: str, year: str = "", cit: dict = {}) -> dict | None:
+    """
+    CrossRef API — better for IEEE/ACM/older paywalled papers.
+    Uses combined title + author matching to avoid false positives.
+    """
     import httpx
     try:
-        params = {"query.title": title, "rows": 3, "select": "title,author,published,DOI"}
+        params = {"query.title": title, "rows": 5, "select": "title,author,published,DOI"}
         resp = httpx.get(
             "https://api.crossref.org/works",
             params=params,
@@ -203,22 +242,39 @@ def _crossref_lookup(title: str, year: str = "") -> dict | None:
         )
         resp.raise_for_status()
         items = resp.json().get("message", {}).get("items", [])
+
+        cit_authors = cit.get("authors", [])
+
         for item in items:
             cr_title = item.get("title", [""])[0]
-            if not _title_similar(title, cr_title):
+            if not cr_title:
                 continue
-            authors = []
+
+            overlap = _title_overlap(title, cr_title)
+
+            # Strict title match required
+            if overlap < 0.6:
+                continue
+
+            # Extract found authors
+            found_authors = []
             for a in item.get("author", []):
                 name = f"{a.get('given', '')} {a.get('family', '')}".strip()
                 if name:
-                    authors.append(name)
+                    found_authors.append(name)
+
+            # If title overlap is borderline, require author match too
+            if overlap < 0.8 and not _any_author_match(found_authors, cit_authors):
+                continue
+
             pub_year = None
             date_parts = item.get("published", {}).get("date-parts", [[]])
             if date_parts and date_parts[0]:
                 pub_year = date_parts[0][0]
+
             return {
                 "title": cr_title,
-                "authors": authors,
+                "authors": found_authors,
                 "year": pub_year,
                 "abstract": "",
                 "citation_count": 0,
@@ -236,6 +292,28 @@ def _crossref_lookup(title: str, year: str = "") -> dict | None:
 
 # ── Existence check ───────────────────────────────────────────────────────────
 
+def _year_mismatch(cit_year: str, found_year) -> bool:
+    """
+    Returns True only if the year difference is suspicious.
+    Older editions found (e.g. 1988 vs 2019) are NOT flagged —
+    they likely represent the same book in an earlier edition.
+    Only flag if found year is NEWER than cited, or gap is small (≤3 years).
+    """
+    if not cit_year or not found_year:
+        return False
+    try:
+        cy = int(str(cit_year))
+        fy = int(str(found_year))
+    except (ValueError, TypeError):
+        return False
+
+    if fy > cy:
+        return True   # found something newer — genuinely wrong
+    if cy - fy <= 3:
+        return True   # small gap — likely wrong paper not just older edition
+    return False      # large gap — likely older edition of same work, skip
+
+
 def _existence_check(citations: list[dict], progress_bar=None) -> list[dict]:
     from core.semantic_scholar import lookup_by_doi, lookup_by_title
 
@@ -248,13 +326,19 @@ def _existence_check(citations: list[dict], progress_bar=None) -> list[dict]:
             )
 
         paper = None
+
+        # 1. DOI lookup — most reliable
         if cit.get("doi"):
             paper = lookup_by_doi(cit["doi"])
+
+        # 2. Semantic Scholar title search
         if not paper and cit.get("title"):
             paper = lookup_by_title(cit["title"])
             time.sleep(0.5)
+
+        # 3. CrossRef — better for books/older/paywalled papers
         if not paper and cit.get("title"):
-            paper = _crossref_lookup(cit["title"], cit.get("year", ""))
+            paper = _crossref_lookup(cit["title"], cit.get("year", ""), cit)
 
         if not paper:
             results.append({
@@ -274,11 +358,14 @@ def _existence_check(citations: list[dict], progress_bar=None) -> list[dict]:
             continue
 
         mismatches = []
-        if not _title_similar(cit["title"], paper["title"]):
+
+        # Title check
+        if not _title_similar(cit["title"], paper["title"], threshold=0.5):
             mismatches.append(f"Title mismatch — found: '{paper['title'][:80]}'")
-        if cit.get("year") and paper.get("year"):
-            if str(cit["year"]) != str(paper["year"]):
-                mismatches.append(f"Year mismatch — found: {paper['year']}")
+
+        # Year check — smart edition-aware
+        if _year_mismatch(cit.get("year", ""), paper.get("year")):
+            mismatches.append(f"Year mismatch — found: {paper['year']}")
 
         if mismatches:
             results.append({
@@ -306,7 +393,7 @@ def _existence_check(citations: list[dict], progress_bar=None) -> list[dict]:
                 "matched_authors": paper.get("authors", []),
                 "doi": paper.get("doi") or cit.get("doi", ""),
             })
-        # Log to MLflow
+
     # Log to MLflow
     try:
         from eval.mlflow_logger import log_citecheck_run
@@ -383,7 +470,6 @@ def render():
         "and metadata is correct. Supports BibTeX, numbered lists, APA, PDF, and plain text."
     )
 
-    # Coming soon banner
     st.info(
         "🔬 **Claim-level verification coming soon** — "
         "CiteLens will check whether each cited paper actually supports "
@@ -397,7 +483,6 @@ def render():
         "📝 Paste full text",
     ])
 
-    # ── Tab 1: paste reference list ───────────────────────────────────────────
     with tab_refs:
         st.caption(
             "Paste your bibliography in **any format** — "
@@ -453,7 +538,6 @@ def render():
                     progress.empty()
                     _render_results(results)
 
-    # ── Tab 2: PDF upload ─────────────────────────────────────────────────────
     with tab_pdf:
         st.caption(
             "Upload your paper PDF. We extract the references section "
@@ -505,7 +589,6 @@ def render():
                     progress.empty()
                     _render_results(results)
 
-    # ── Tab 3: paste full text ────────────────────────────────────────────────
     with tab_text:
         st.caption(
             "Paste your paper text. We find the References section "
@@ -533,7 +616,6 @@ def render():
                     with st.spinner("Parsing references section..."):
                         citations = _parse_reference_list(refs_section)
                 else:
-                    # No clear references section — try parsing whole text
                     with st.spinner("Parsing text as reference list..."):
                         citations = _parse_reference_list(cleaned)
 
